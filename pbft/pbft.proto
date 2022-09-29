@@ -1,0 +1,50 @@
+syntax = "proto3";
+
+option go_package = "github.com/anxinzhou/LPBFT/pbft/pbft";
+package pbft;
+// The greeter service definition.
+//service Greeter {
+//  // Sends a greeting
+//  rpc SayHello (HelloRequest) returns (HelloReply) {}
+//}
+
+service Consensus {
+  rpc GetPublicKey(pkRequest) returns (pkResponse) {}
+  rpc CStream (stream cRequest) returns (stream cResponse) {}
+}
+
+enum cMsgType {
+  PREPREPARE = 0;
+  PREPARE = 1;   // broadcast prepare on receiving preprepare
+  COMMIT = 2;   // broadcast commit on receiving enough prepare
+}
+
+message pkRequest {
+//  bytes payload = 1;
+}
+
+message pkResponse {
+  bytes payload = 1;
+}
+
+message cRequest {
+  cMsgType msgType = 1;
+  bytes payload = 2;
+  bytes signature = 3; // only used for prepare aggregation. Others are verified by TLS
+}
+
+message cResponse {
+  cMsgType msgType = 1;
+  bytes payload = 2;
+  bytes signature = 3; // only used for commit aggregation
+}
+
+// The request message containing the user's name.
+//message HelloRequest {
+//  string name = 1;
+//}
+//
+//// The response message containing the greetings
+//message HelloReply {
+//  string message = 1;
+//}
