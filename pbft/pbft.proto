@@ -20,7 +20,6 @@ enum cMsgType {
 }
 
 message pkRequest {
-//  bytes payload = 1;
 }
 
 message pkResponse {
@@ -30,21 +29,9 @@ message pkResponse {
 message cRequest {
   cMsgType msgType = 1;
   bytes payload = 2;
-  bytes signature = 3; // only used for prepare aggregation. Others are verified by TLS
+  bytes signature = 3;
 }
 
 message cResponse {
-  cMsgType msgType = 1;
-  bytes payload = 2;
-  bytes signature = 3; // only used for commit aggregation
-}
 
-// The request message containing the user's name.
-//message HelloRequest {
-//  string name = 1;
-//}
-//
-//// The response message containing the greetings
-//message HelloReply {
-//  string message = 1;
-//}
+}

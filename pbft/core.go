@@ -5,10 +5,13 @@ import (
 	"context"
 	"crypto/ecdsa"
 	"encoding/json"
+	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/crypto"
+	"golang.org/x/crypto/sha3"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"log"
+	"math/big"
 	"sync"
 )
 
@@ -16,25 +19,30 @@ import (
 
 type PBFT struct {
 	peers      []*Peer
-	cInstances map[int][]*ConsensusInstance
+	cInstances map[string][]*ConsensusInstance // map client and its consensus instance
+	cSeqNum    map[string]int                  // map client and its sequence number
+	cPrimary   map[string]int                  // map client to a fixed primary; may change with view change
 
 	f int
 	n int
 
-	privateKey *ecdsa.PrivateKey
-	serverID   int
+	PublicKeyByte []byte
+	privateKey    *ecdsa.PrivateKey
+	serverID      int
 }
 
 type Peer struct {
-	ClientStream Consensus_CStreamClient
-	PublicKey    *ecdsa.PublicKey
+	ClientStream  Consensus_CStreamClient
+	PublicKeyByte []byte
 }
 
 func NewPBFT(serverID int, faultTolerance int) *PBFT {
 
 	pbft := &PBFT{
 		peers:      []*Peer{},
-		cInstances: make(map[int][]*ConsensusInstance),
+		cInstances: make(map[string][]*ConsensusInstance),
+		cSeqNum:    make(map[string]int),
+		cPrimary:   make(map[string]int),
 		serverID:   serverID,
 		f:          faultTolerance,
 		n:          3*faultTolerance + 1,
@@ -42,6 +50,7 @@ func NewPBFT(serverID int, faultTolerance int) *PBFT {
 
 	var err error
 	pbft.privateKey, err = crypto.GenerateKey()
+	pbft.PublicKeyByte = crypto.FromECDSAPub(&pbft.privateKey.PublicKey)
 
 	if err != nil {
 		log.Fatalf("Fail to generate private key")
@@ -50,23 +59,43 @@ func NewPBFT(serverID int, faultTolerance int) *PBFT {
 	return pbft
 }
 
-func (pbft *PBFT) PublicKey() *ecdsa.PublicKey {
-	return &pbft.privateKey.PublicKey
+func (pbft *PBFT) PrimaryOfClient(clientPublicKeyByte []byte) int {
+	address := publicKeyByteToAddress(clientPublicKeyByte)
+
+	log.Print(address)
+	var addressInt big.Int
+	// [:2] is to remove "0X"
+	_, ok := addressInt.SetString(address[2:], 16)
+	if !ok {
+		log.Fatalf("Fail to convert address to big int")
+	}
+
+	primary, ok := pbft.cPrimary[address]
+	if !ok {
+		// set default primary
+		var remainder big.Int
+		addressInt.DivMod(&addressInt, big.NewInt(int64(len(pbft.peers))), &remainder)
+		pbft.cPrimary[address] = int(remainder.Int64())
+		return pbft.cPrimary[address]
+	} else {
+		return primary
+	}
 }
 
 func (pbft *PBFT) AddInstance(insID *InstanceID, instance *ConsensusInstance) {
-	clientID := insID.ClientPublicKey
+	address := publicKeyByteToAddress(insID.ClientPublicKeyByte)
+
 	seqNum := insID.SequenceNum
 	// initialize map if not done before
-	if pbft.cInstances[clientID] == nil {
-		pbft.cInstances[clientID] = make([]*ConsensusInstance, 0)
+	if pbft.cInstances[address] == nil {
+		pbft.cInstances[address] = make([]*ConsensusInstance, 0)
 	}
 
 	// if instance not created before
-	if len(pbft.cInstances[clientID]) <= seqNum {
-		pbft.cInstances[clientID] = append(pbft.cInstances[clientID], instance)
+	if len(pbft.cInstances[address]) <= seqNum {
+		pbft.cInstances[address] = append(pbft.cInstances[address], instance)
 	} else {
-		pbft.cInstances[clientID][seqNum] = instance
+		pbft.cInstances[address][seqNum] = instance
 	}
 }
 
@@ -92,11 +121,6 @@ func (pbft *PBFT) ConnectPeers(peerAddrs []string) {
 				log.Fatalf("Fail to receive peer's public key")
 			}
 
-			peerPK, err := crypto.UnmarshalPubkey(peerPkResp.Payload)
-			if err != nil {
-				log.Fatalf("Cannot unmarshal public key payload %v", err)
-			}
-
 			// Contact the server and print out its response.
 			stream, err := client.CStream(context.Background())
 			if err != nil {
@@ -104,49 +128,53 @@ func (pbft *PBFT) ConnectPeers(peerAddrs []string) {
 			}
 
 			pbft.peers[index] = &Peer{
-				ClientStream: stream,
-				PublicKey:    peerPK,
+				ClientStream:  stream,
+				PublicKeyByte: peerPkResp.Payload,
 			}
 		}()
 	}
 	wg.Wait()
 }
 
-func (pbft *PBFT) Instance(insID *InstanceID) (*ConsensusInstance, bool) {
-	clientID := insID.ClientID
-	seqNum := insID.SequenceNum
+func publicKeyByteToAddress(pk []byte) string {
+	var buf []byte
+	hash := sha3.NewLegacyKeccak256()
+	hash.Write(pk[1:]) // remove EC prefix 04
+	buf = hash.Sum(nil)
+	publicAddress := hexutil.Encode(buf[12:])
+	return publicAddress
+}
 
-	if instances, ok := pbft.cInstances[clientID]; ok {
-		if len(instances) <= seqNum {
+func (pbft *PBFT) Instance(insID *InstanceID) (*ConsensusInstance, bool) {
+
+	address := publicKeyByteToAddress(insID.ClientPublicKeyByte)
+
+	if instances, ok := pbft.cInstances[address]; ok {
+		if len(instances) <= insID.SequenceNum {
 			return nil, false
 		} else {
-			return instances[seqNum], true
+			return instances[insID.SequenceNum], true
 		}
 	}
+
 	return nil, false
 }
 
-func verifyClientMsg(clientMsg *ClientMsg) bool {
-	// verify client signature
-	publicKeyBytes := crypto.FromECDSAPub(clientMsg.InsID.ClientPublicKey)
-	hash := crypto.Keccak256Hash(clientMsg.Payload)
-	sigPublicKey, err := crypto.Ecrecover(hash.Bytes(), clientMsg.Signature)
+func verifySignature(publicKeyByte []byte, data []byte, signature []byte) bool {
+	hash := crypto.Keccak256Hash(data)
+	sigPublicKey, err := crypto.Ecrecover(hash.Bytes(), signature)
 	if err != nil {
-		log.Fatal(err)
-	}
-	if !bytes.Equal(publicKeyBytes, sigPublicKey) {
-		log.Printf("Incorrect client signature")
+		log.Printf(err.Error())
 		return false
 	}
-	// verify sequence number  // TODO
-
-	// verify view number // TODO
-
+	if !bytes.Equal(publicKeyByte, sigPublicKey) {
+		return false
+	}
 	return true
 }
 
-func (pbft *PBFT) signPayload(payload []byte) []byte {
-	hash := crypto.Keccak256Hash(payload)
+func (pbft *PBFT) signDataByte(dataByte []byte) []byte {
+	hash := crypto.Keccak256Hash(dataByte)
 	signature, err := crypto.Sign(hash.Bytes(), pbft.privateKey)
 	if err != nil {
 		log.Fatal(err)
@@ -154,22 +182,47 @@ func (pbft *PBFT) signPayload(payload []byte) []byte {
 	return signature
 }
 
+func (pbft *PBFT) verifyClientMsg(clientMsg *ClientMsg) bool {
+	// the signature should be correct
+	if !verifySignature(clientMsg.InsID.ClientPublicKeyByte, clientMsg.Payload, clientMsg.Signature) {
+		log.Printf("Incorrect client signature")
+		return false
+	}
+
+	// the instance with seq - 1 should be finished
+	if clientMsg.InsID.SequenceNum > 0 {
+		previousInsID := &InstanceID{
+			ClientPublicKeyByte: clientMsg.InsID.ClientPublicKeyByte,
+			SequenceNum:         clientMsg.InsID.SequenceNum - 1,
+		}
+
+		previousCInstance, ok := pbft.Instance(previousInsID)
+		if !ok || !previousCInstance.Committed {
+			log.Printf("Instance %d should be committed", clientMsg.InsID.SequenceNum-1)
+			return false
+		}
+	}
+
+	// there cannot be ongoing instance with seq (TODO here not consider view change)
+	if cInstance, ok := pbft.Instance(clientMsg.InsID); ok {
+		log.Printf("There should be ongoing instance %d", cInstance.InsID.SequenceNum)
+	}
+
+	return true
+}
+
 // by the primary
 func (pbft *PBFT) BroadcastPreprepare(clientMsg *ClientMsg) {
 	log.Printf("Send a preprepare")
 
-	if !verifyClientMsg(clientMsg) {
+	if !pbft.verifyClientMsg(clientMsg) {
 		return
 	}
-
-	// create a new instance
-	instance := NewConsensusInstance(clientMsg.InsID, clientMsg.MessageType, clientMsg.Payload)
-	pbft.AddInstance(clientMsg.InsID, instance)
 
 	preprepareMsg := &PreprerareMsg{
 		InsID:     clientMsg.InsID,
 		PrimaryID: pbft.serverID,
-		ViewNum:   0,
+		ViewNum:   0, // TODO
 		Timestamp: 1, // TODO
 		Msg:       clientMsg,
 	}
@@ -188,20 +241,8 @@ func (pbft *PBFT) BroadcastPreprepare(clientMsg *ClientMsg) {
 	pbft.Broadcast(request)
 }
 
-func (pbft *PBFT) verifyPreprepareMsg(preprepareMsg *PreprerareMsg) bool {
-
-	// so far only verify client message
-	if !verifyClientMsg(preprepareMsg.Msg) {
-		return false
-	}
-
-	// TODO verify it is the right primary
-	// TODO verify sequence number and view number
-	return true
-}
-
 // by backups
-func (pbft *PBFT) ReceivePreprepare(stream Consensus_CStreamServer, request *CRequest) {
+func (pbft *PBFT) ReceivePreprepare(request *CRequest) {
 
 	//log.Printf("Preprepare response")
 	var preprepareMsg PreprerareMsg
@@ -212,16 +253,24 @@ func (pbft *PBFT) ReceivePreprepare(stream Consensus_CStreamServer, request *CRe
 
 	// verify preprepareMsg
 
-	if !pbft.verifyPreprepareMsg(&preprepareMsg) {
+	// so far only verify client message
+	clientMsg := preprepareMsg.Msg
+	if !pbft.verifyClientMsg(clientMsg) {
+		log.Printf("Incorrect client signature")
 		return
 	}
 
-	// Create an instance for backups
-	if pbft.serverID != preprepareMsg.PrimaryID {
-		pbft.AddInstance(
-			preprepareMsg.InsID,
-			NewConsensusInstance(preprepareMsg.InsID, preprepareMsg.Msg.MessageType, preprepareMsg.Msg.Payload))
+	// from the right primary
+	primary := pbft.PrimaryOfClient(clientMsg.InsID.ClientPublicKeyByte)
+	if primary != preprepareMsg.PrimaryID {
+		log.Printf("From incorrect primary")
+		return
 	}
+
+	// add a new instance
+	pbft.AddInstance(
+		preprepareMsg.InsID,
+		NewConsensusInstance(preprepareMsg.InsID, preprepareMsg.Msg.MessageType, preprepareMsg.Msg.Payload))
 
 	prepareRequest := &PrepareMsg{
 		InsID:    preprepareMsg.InsID,
@@ -234,50 +283,107 @@ func (pbft *PBFT) ReceivePreprepare(stream Consensus_CStreamServer, request *CRe
 		log.Fatalf("cannot marshal request")
 	}
 
-	signature := pbft.signPayload(payload)
+	signature := pbft.signDataByte(payload)
 
-	response := &CResponse{
+	nextReq := &CRequest{
 		MsgType:   CMsgType_PREPARE,
 		Payload:   payload,
 		Signature: signature,
 	}
 
-	pbft.Broadcast()
+	pbft.Broadcast(nextReq)
 }
 
-func (pbft *PBFT) ReceivePrepare(stream Consensus_CStreamServer, request *CRequest) {
+func (pbft *PBFT) ReceivePrepare(request *CRequest) {
 	//log.Printf("Preprepare response")
-	var aggregatedPrepareMsg AggregatedPrepareMsg
-	err := json.Unmarshal(request.Payload, &aggregatedPrepareMsg)
+	var prepareMsg PrepareMsg
+	err := json.Unmarshal(request.Payload, &prepareMsg)
 	if err != nil {
 		log.Fatalf("cannot unmarshal payload")
 	}
-	//log.Printf("Receive aggregated prepares from the primary")
-	// process preprepare response
 
-	//cInstance, _ := pbft.Instance(prepareResponse.InsID)
-
-	commitMsg := &CommitMsg{
-		InsID:    aggregatedPrepareMsg.InsID,
-		ServerID: pbft.serverID,
-		ViewNum:  aggregatedPrepareMsg.ViewNum,
-		//Timestamp: preprepareResponse
-		//MsgDigest: []byte("test"),
+	// verify prepare message
+	// check the signature
+	fromServer := prepareMsg.ServerID
+	fromServerPublicKeyByte := pbft.peers[fromServer].PublicKeyByte
+	if !verifySignature(fromServerPublicKeyByte, request.Payload, request.Signature) {
+		log.Printf("Incorrect prepare signature")
 	}
 
-	payload, err := json.Marshal(commitMsg)
+	cInstance, ok := pbft.Instance(prepareMsg.InsID)
+	if !ok {
+		log.Printf("should receive preprepare first before accepting a prepare")
+		return
+	}
+
+	cInstance.Lock()
+	defer cInstance.Unlock()
+	cInstance.AddPrepareMsg(&prepareMsg)
+
+	// after collecting enough prepares
+	if len(cInstance.Prepares) == 2*pbft.f+1 {
+		log.Printf("Request prepared")
+		cInstance.Prepared = true
+		commitMsg := &CommitMsg{
+			InsID:    prepareMsg.InsID,
+			ServerID: pbft.serverID,
+			ViewNum:  prepareMsg.ViewNum,
+		}
+
+		payload, err := json.Marshal(commitMsg)
+		if err != nil {
+			log.Fatalf("cannot marshal request")
+		}
+
+		signature := pbft.signDataByte(payload)
+
+		nextRequest := &CRequest{
+			MsgType:   CMsgType_COMMIT,
+			Payload:   payload,
+			Signature: signature,
+		}
+
+		pbft.Broadcast(nextRequest)
+	}
+}
+
+func (pbft *PBFT) ReceiveCommit(request *CRequest) {
+	//log.Printf("Preprepare response")
+	var commitMsg CommitMsg
+	err := json.Unmarshal(request.Payload, &commitMsg)
 	if err != nil {
-		log.Fatalf("cannot marshal request")
+		log.Fatalf("cannot unmarshal payload")
 	}
 
-	response := &CResponse{
-		MsgType: CMsgType_COMMIT,
-		Payload: payload,
+	// verify prepare message
+	// check the signature
+	fromServer := commitMsg.ServerID
+	fromServerPublicKeyByte := pbft.peers[fromServer].PublicKeyByte
+
+	if !verifySignature(fromServerPublicKeyByte, request.Payload, request.Signature) {
+		log.Printf("Incorrect commit signature")
 	}
 
-	err = stream.Send(response)
-	if err != nil {
-		log.Fatalf("Fail to send commit message")
+	cInstance, ok := pbft.Instance(commitMsg.InsID)
+	if !ok {
+		log.Printf("should receive preprepare first before accepting a prepare")
+		return
+	}
+
+	cInstance.Lock()
+	defer cInstance.Unlock()
+	cInstance.AddCommitMsg(&commitMsg)
+
+	// after collecting enough prepares
+	if len(cInstance.Commits) == 2*pbft.f+1 {
+		log.Printf("Request committed")
+		cInstance.Prepared = true
+		cInstance.Committed = true
+		address := publicKeyByteToAddress(cInstance.InsID.ClientPublicKeyByte)
+		pbft.cSeqNum[address] += 1
+		// TODO execute operation
+
+		// response to the client
 	}
 }
 
@@ -291,126 +397,17 @@ func (pbft *PBFT) Broadcast(request *CRequest) {
 	}
 }
 
-func (pbft *PBFT) AggregatePrepare(response *CResponse) {
-	// aggregate prepares
-	var prepareMsg PrepareMsg
-	err := json.Unmarshal(response.Payload, &prepareMsg)
-	if err != nil {
-		log.Printf("Cannot unmarshal prepare request")
-	}
-
-	cInstance, ok := pbft.Instance(prepareMsg.InsID)
-	if !ok {
-		log.Fatalf("instance not exist")
-	}
-	cInstance.Lock()
-	defer cInstance.Unlock()
-	cInstance.AddPrepareMsg(&prepareMsg)
-	if len(cInstance.Prepares) == 2*pbft.f+1 {
-		log.Printf("broadcast aggregated prepares")
-		//TODO
-		aggregatedPrepares := &AggregatedPrepareMsg{
-			InsID:    prepareMsg.InsID,
-			ServerID: pbft.serverID,
-			ViewNum:  prepareMsg.ViewNum,
-			//Timestamp: preprepareResponse
-			//MsgDigest: []byte("test"),
-			Signature: []byte("signature"),
-		}
-		payload, err := json.Marshal(aggregatedPrepares)
-		if err != nil {
-			log.Fatalf("cannot marshal request")
-		}
-		pbft.Broadcast(&CRequest{
-			MsgType: CMsgType_AGGREGATED_PREPARE,
-			Payload: payload,
-		})
-	}
-	// broadcast a prepare response after collecting prepares
-}
-
-func (pbft *PBFT) AggregateCommit(response *CResponse) {
-	// aggregate commits
-	var commitMsg CommitMsg
-	err := json.Unmarshal(response.Payload, &commitMsg)
-	if err != nil {
-		log.Printf("Cannot unmarshal prepare request")
-	}
-
-	cInstance, ok := pbft.Instance(commitMsg.InsID)
-	if !ok {
-		log.Fatalf("instance not exist")
-	}
-
-	cInstance.Lock()
-	defer cInstance.Unlock()
-	cInstance.AddCommitMsg(&commitMsg)
-	if len(cInstance.Commits) == 2*pbft.f+1 {
-		//TODO
-		log.Printf("broadcast aggregated commits")
-		aggregatedCommitMsg := &AggregatedCommitMsg{
-			InsID:    commitMsg.InsID,
-			ServerID: pbft.serverID,
-			ViewNum:  commitMsg.ViewNum,
-			//Timestamp: preprepareResponse
-			//MsgDigest: []byte("test"),
-			Signature: []byte("signature"),
-		}
-		payload, err := json.Marshal(aggregatedCommitMsg)
-		if err != nil {
-			log.Fatalf("cannot marshal request")
-		}
-		pbft.Broadcast(&CRequest{
-			MsgType: CMsgType_AGGREGATED_COMMIT,
-			Payload: payload,
-		})
-	}
-	// broadcast a prepare response after collecting prepares
-}
-
-func (pbft *PBFT) Commit() {
-	// TODO
-}
-
 // Backup event loop is to react on request
-func (pbft *PBFT) BackupEventLoop(stream Consensus_CStreamServer, request *CRequest) {
+func (pbft *PBFT) EventLoop(stream Consensus_CStreamServer, request *CRequest) {
 	switch request.MsgType {
 	case CMsgType_PREPREPARE:
 		// on receive preprepare, broadcast prepare
-		pbft.ReceivePreprepare(stream, request)
+		pbft.ReceivePreprepare(request)
 	case CMsgType_PREPARE:
 		// on receiving enough prepare, broadcast commit
-		pbft.ReceivePrepare(stream, request)
+		pbft.ReceivePrepare(request)
 	case CMsgType_COMMIT:
 		// on receive enough commit, execute operation
-		log.Printf("on receive a commit response, execute the operation")
-		pbft.ReceiveCommit(stream, request)
+		pbft.ReceiveCommit(request)
 	}
 }
-
-// Primary event loop is to react on response
-func (pbft *PBFT) PrimaryEventLoop() {
-	var wg sync.WaitGroup
-	for i, _ := range pbft.peers {
-		peer := pbft.peers[i]
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for {
-				response, err := peer.ClientStream.Recv()
-				if err != nil {
-					log.Fatalf("fail to receive response")
-				}
-				switch response.MsgType {
-				case CMsgType_PREPARE:
-					pbft.ReceivePrepare()
-				}
-			}
-		}()
-	}
-	wg.Wait()
-}
-
-//func ConsensusInstanceID(clientID int, sequenceNum int) string {
-//	return strconv.Itoa(clientID) + "#" + strconv.Itoa(sequenceNum)
-//}

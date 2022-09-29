@@ -2,11 +2,9 @@ package main
 
 import (
 	"context"
-	"crypto/elliptic"
 	"flag"
 	"fmt"
 	pb "github.com/anxinzhou/LPBFT/pbft"
-	"github.com/ethereum/go-ethereum/crypto/secp256k1"
 	"google.golang.org/grpc"
 	"io"
 	"log"
@@ -21,10 +19,8 @@ type Server struct {
 }
 
 func (s *Server) GetPublicKey(ctx context.Context, pkrequest *pb.PkRequest) (*pb.PkResponse, error) {
-	pk := s.pbft.PublicKey()
-	payload := elliptic.Marshal(secp256k1.S256(), pk.X, pk.Y)
 	return &pb.PkResponse{
-		Payload: payload,
+		Payload: s.pbft.PublicKeyByte,
 	}, nil
 }
 
@@ -37,7 +33,7 @@ func (s *Server) CStream(stream pb.Consensus_CStreamServer) error {
 		if err != nil {
 			log.Fatalf("can not receive %v", err)
 		}
-		s.pbft.BackupEventLoop(stream, request)
+		s.pbft.EventLoop(stream, request)
 	}
 }
 
@@ -92,11 +88,15 @@ func main() {
 	}()
 
 	pbft.ConnectPeers(serverAddrs)
-	go pbft.PrimaryEventLoop()
 
+	//TODO so far different server will generate different fake client
+	fakeClient := pb.NewFakeClient()
 	// if is primary
-	if *port == 50001 {
-		clientMsg := pb.MakeFakeRequest()
+	primary := pbft.PrimaryOfClient(fakeClient.PublicKeyByte)
+	log.Printf("The primary of the fake client is %d", primary)
+	// assign client to a fixed primary
+	if *serverID == primary {
+		clientMsg := fakeClient.MakeFakeRequest()
 		pbft.BroadcastPreprepare(clientMsg)
 	}
 	wg.Wait()

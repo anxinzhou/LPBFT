@@ -1,13 +1,12 @@
 package pbft
 
 import (
-	"crypto/ecdsa"
 	"sync"
 )
 
 type InstanceID struct {
-	ClientPublicKey *ecdsa.PublicKey
-	SequenceNum     int
+	ClientPublicKeyByte []byte
+	SequenceNum         int
 }
 
 type ConsensusInstance struct {
