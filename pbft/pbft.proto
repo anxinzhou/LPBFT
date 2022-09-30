@@ -10,13 +10,16 @@ package pbft;
 
 service Consensus {
   rpc GetPublicKey(pkRequest) returns (pkResponse) {}
-  rpc CStream (stream cRequest) returns (stream cResponse) {}
+  rpc PBFTMessaging (stream pbftRequest) returns (pbftResponse) {} // used for pbft among servers
+  rpc ClientOperation (operationRequest) returns (operationResponse) {}
 }
 
 enum cMsgType {
   PREPREPARE = 0;
   PREPARE = 1;   // broadcast prepare on receiving preprepare
-  COMMIT = 2;   // broadcast commit on receiving enough prepare
+  AGGREGATED_PREPARE = 2;
+  COMMIT = 3;   // broadcast commit on receiving enough prepare
+  AGGREGATED_COMMIT = 4;
 }
 
 message pkRequest {
@@ -26,12 +29,20 @@ message pkResponse {
   bytes payload = 1;
 }
 
-message cRequest {
+message pbftRequest {
   cMsgType msgType = 1;
   bytes payload = 2;
   bytes signature = 3;
 }
 
-message cResponse {
+message pbftResponse {
+
+}
+
+message operationRequest {
+  bytes payload = 1;
+}
+
+message operationResponse {
 
 }

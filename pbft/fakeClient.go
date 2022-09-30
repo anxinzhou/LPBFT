@@ -11,9 +11,11 @@ type FakeClient struct {
 	PublicKeyByte []byte
 	privateKey    *ecdsa.PrivateKey
 	SeqNum        int
+	Primary       int
 }
 
-func NewFakeClient() *FakeClient {
+// so far let client appoint the primary
+func NewFakeClient(primay int) *FakeClient {
 	// Generate a key pair for the client
 	privateKey, err := crypto.GenerateKey()
 
@@ -27,6 +29,7 @@ func NewFakeClient() *FakeClient {
 		PublicKeyByte: publicKeyByte,
 		privateKey:    privateKey,
 		SeqNum:        0,
+		Primary:       primay,
 	}
 }
 
@@ -41,10 +44,6 @@ func (c *FakeClient) SignDataByte(data []byte) []byte {
 }
 
 func (c *FakeClient) MakeFakeRequest() *ClientMsg {
-	log.Printf("test2")
-	// if is a primary
-	//if *port == 50001 {
-	log.Print("I am the primary")
 
 	paymentMsg := &PaymentMsg{
 		InsID: &InstanceID{
@@ -52,7 +51,7 @@ func (c *FakeClient) MakeFakeRequest() *ClientMsg {
 			SequenceNum:         c.SeqNum,
 		},
 		UTXOIns: []UTXOInput{
-			UTXOInput{
+			{
 				PreviousTx: []byte("0x"),
 				Loc:        0,
 			},
@@ -78,6 +77,7 @@ func (c *FakeClient) MakeFakeRequest() *ClientMsg {
 			SequenceNum:         c.SeqNum,
 		},
 		Payload:   payload,
+		Primary:   c.Primary,
 		Signature: signature,
 	}
 

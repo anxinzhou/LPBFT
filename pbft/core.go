@@ -7,21 +7,25 @@ import (
 	"encoding/json"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/orcaman/concurrent-map/v2"
 	"golang.org/x/crypto/sha3"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"log"
-	"math/big"
 	"sync"
+	"sync/atomic"
+	"time"
 )
+
+var commitCount atomic.Int32
+var prepareCount atomic.Int32
 
 // fault tolerance level
 
 type PBFT struct {
 	peers      []*Peer
-	cInstances map[string][]*ConsensusInstance // map client and its consensus instance
-	cSeqNum    map[string]int                  // map client and its sequence number
-	cPrimary   map[string]int                  // map client to a fixed primary; may change with view change
+	cInstances cmap.ConcurrentMap[[]*ConsensusInstance] // map client and its consensus instance
+	cSeqNum    cmap.ConcurrentMap[int]                  // map client and its sequence number
 
 	f int
 	n int
@@ -32,7 +36,7 @@ type PBFT struct {
 }
 
 type Peer struct {
-	ClientStream  Consensus_CStreamClient
+	ClientStream  Consensus_PBFTMessagingClient
 	PublicKeyByte []byte
 }
 
@@ -40,12 +44,12 @@ func NewPBFT(serverID int, faultTolerance int) *PBFT {
 
 	pbft := &PBFT{
 		peers:      []*Peer{},
-		cInstances: make(map[string][]*ConsensusInstance),
-		cSeqNum:    make(map[string]int),
-		cPrimary:   make(map[string]int),
-		serverID:   serverID,
-		f:          faultTolerance,
-		n:          3*faultTolerance + 1,
+		cInstances: cmap.New[[]*ConsensusInstance](),
+		cSeqNum:    cmap.New[int](),
+		//cPrimary:   make(map[string]int),
+		serverID: serverID,
+		f:        faultTolerance,
+		n:        3*faultTolerance + 1,
 	}
 
 	var err error
@@ -59,43 +63,48 @@ func NewPBFT(serverID int, faultTolerance int) *PBFT {
 	return pbft
 }
 
-func (pbft *PBFT) PrimaryOfClient(clientPublicKeyByte []byte) int {
-	address := publicKeyByteToAddress(clientPublicKeyByte)
-
-	log.Print(address)
-	var addressInt big.Int
-	// [:2] is to remove "0X"
-	_, ok := addressInt.SetString(address[2:], 16)
-	if !ok {
-		log.Fatalf("Fail to convert address to big int")
-	}
-
-	primary, ok := pbft.cPrimary[address]
-	if !ok {
-		// set default primary
-		var remainder big.Int
-		addressInt.DivMod(&addressInt, big.NewInt(int64(len(pbft.peers))), &remainder)
-		pbft.cPrimary[address] = int(remainder.Int64())
-		return pbft.cPrimary[address]
-	} else {
-		return primary
-	}
-}
+//func (pbft *PBFT) PrimaryOfClient(clientPublicKeyByte []byte) int {
+//	address := publicKeyByteToAddress(clientPublicKeyByte)
+//
+//	//log.Print(address)
+//	var addressInt big.Int
+//	// [:2] is to remove "0X"
+//	_, ok := addressInt.SetString(address[2:], 16)
+//	if !ok {
+//		log.Fatalf("Fail to convert address to big int")
+//	}
+//
+//	primary, ok := pbft.cPrimary[address]
+//	if !ok {
+//		// set default primary
+//		var remainder big.Int
+//		addressInt.DivMod(&addressInt, big.NewInt(int64(len(pbft.peers))), &remainder)
+//		pbft.cPrimary[address] = int(remainder.Int64())
+//		return pbft.cPrimary[address]
+//	} else {
+//		return primary
+//	}
+//}
 
 func (pbft *PBFT) AddInstance(insID *InstanceID, instance *ConsensusInstance) {
 	address := publicKeyByteToAddress(insID.ClientPublicKeyByte)
 
 	seqNum := insID.SequenceNum
 	// initialize map if not done before
-	if pbft.cInstances[address] == nil {
-		pbft.cInstances[address] = make([]*ConsensusInstance, 0)
-	}
+	//if pbft.cInstances.Count(address) == 0 {
+	//	pbft.cInstances.Get()
+	//	pbft.cInstances[address] = make([]*ConsensusInstance, 0)
+	//}
+
+	pbft.cInstances.SetIfAbsent(address, make([]*ConsensusInstance, 0))
 
 	// if instance not created before
-	if len(pbft.cInstances[address]) <= seqNum {
-		pbft.cInstances[address] = append(pbft.cInstances[address], instance)
+	cInstances, _ := pbft.cInstances.Get(address)
+	if len(cInstances) <= seqNum {
+		pbft.cInstances.Set(address, append(cInstances, instance))
 	} else {
-		pbft.cInstances[address][seqNum] = instance
+		// update the old
+		cInstances[seqNum] = instance
 	}
 }
 
@@ -118,11 +127,11 @@ func (pbft *PBFT) ConnectPeers(peerAddrs []string) {
 
 			peerPkResp, err := client.GetPublicKey(context.Background(), &PkRequest{})
 			if err != nil {
-				log.Fatalf("Fail to receive peer's public key")
+				log.Fatalf("Fail to receive peer's public key: %v", err)
 			}
 
 			// Contact the server and print out its response.
-			stream, err := client.CStream(context.Background())
+			stream, err := client.PBFTMessaging(context.Background())
 			if err != nil {
 				log.Fatalf("open steam error %v", err)
 			}
@@ -131,6 +140,7 @@ func (pbft *PBFT) ConnectPeers(peerAddrs []string) {
 				ClientStream:  stream,
 				PublicKeyByte: peerPkResp.Payload,
 			}
+			log.Printf("add peer %d", index)
 		}()
 	}
 	wg.Wait()
@@ -149,11 +159,11 @@ func (pbft *PBFT) Instance(insID *InstanceID) (*ConsensusInstance, bool) {
 
 	address := publicKeyByteToAddress(insID.ClientPublicKeyByte)
 
-	if instances, ok := pbft.cInstances[address]; ok {
-		if len(instances) <= insID.SequenceNum {
+	if cInstances, ok := pbft.cInstances.Get(address); ok {
+		if len(cInstances) <= insID.SequenceNum {
 			return nil, false
 		} else {
-			return instances[insID.SequenceNum], true
+			return cInstances[insID.SequenceNum], true
 		}
 	}
 
@@ -212,11 +222,11 @@ func (pbft *PBFT) verifyClientMsg(clientMsg *ClientMsg) bool {
 }
 
 // by the primary
-func (pbft *PBFT) BroadcastPreprepare(clientMsg *ClientMsg) {
+func (pbft *PBFT) BroadcastPreprepare(clientMsg *ClientMsg) chan int {
 	log.Printf("Send a preprepare")
 
 	if !pbft.verifyClientMsg(clientMsg) {
-		return
+		return nil
 	}
 
 	preprepareMsg := &PreprerareMsg{
@@ -232,17 +242,18 @@ func (pbft *PBFT) BroadcastPreprepare(clientMsg *ClientMsg) {
 		log.Fatalf("cannot parse payload")
 	}
 
-	request := &CRequest{
+	request := &PbftRequest{
 		MsgType: CMsgType_PREPREPARE,
 		Payload: payload,
 	}
 
 	// Broadcast preprepare
 	pbft.Broadcast(request)
+	return make(chan int)
 }
 
-// by backups
-func (pbft *PBFT) ReceivePreprepare(request *CRequest) {
+// used by backups
+func (pbft *PBFT) ReceivePreprepare(request *PbftRequest) {
 
 	//log.Printf("Preprepare response")
 	var preprepareMsg PreprerareMsg
@@ -261,16 +272,22 @@ func (pbft *PBFT) ReceivePreprepare(request *CRequest) {
 	}
 
 	// from the right primary
-	primary := pbft.PrimaryOfClient(clientMsg.InsID.ClientPublicKeyByte)
+	//primary := pbft.PrimaryOfClient(clientMsg.InsID.ClientPublicKeyByte)
+	//if primary != preprepareMsg.PrimaryID {
+	//	log.Printf("From incorrect primary")
+	//	return
+	//}
+	primary := clientMsg.Primary
 	if primary != preprepareMsg.PrimaryID {
 		log.Printf("From incorrect primary")
 		return
 	}
 
 	// add a new instance
+	cInstance := NewConsensusInstance(preprepareMsg.InsID, preprepareMsg.Msg.MessageType, preprepareMsg.Msg.Payload, primary)
 	pbft.AddInstance(
-		preprepareMsg.InsID,
-		NewConsensusInstance(preprepareMsg.InsID, preprepareMsg.Msg.MessageType, preprepareMsg.Msg.Payload))
+		preprepareMsg.InsID, cInstance)
+	cInstance.Preprepared = true
 
 	prepareRequest := &PrepareMsg{
 		InsID:    preprepareMsg.InsID,
@@ -285,16 +302,18 @@ func (pbft *PBFT) ReceivePreprepare(request *CRequest) {
 
 	signature := pbft.signDataByte(payload)
 
-	nextReq := &CRequest{
+	nextReq := &PbftRequest{
 		MsgType:   CMsgType_PREPARE,
 		Payload:   payload,
 		Signature: signature,
 	}
 
-	pbft.Broadcast(nextReq)
+	//pbft.Broadcast(nextReq)
+	pbft.SendToPrimary(primary, nextReq)
 }
 
-func (pbft *PBFT) ReceivePrepare(request *CRequest) {
+// used by the primary
+func (pbft *PBFT) ReceivePrepare(request *PbftRequest) {
 	//log.Printf("Preprepare response")
 	var prepareMsg PrepareMsg
 	err := json.Unmarshal(request.Payload, &prepareMsg)
@@ -324,6 +343,11 @@ func (pbft *PBFT) ReceivePrepare(request *CRequest) {
 	if len(cInstance.Prepares) == 2*pbft.f+1 {
 		log.Printf("Request prepared")
 		cInstance.Prepared = true
+
+		prepareCount.Add(1)
+		value := prepareCount.Load()
+		log.Printf("prepare count %d", value)
+
 		commitMsg := &CommitMsg{
 			InsID:    prepareMsg.InsID,
 			ServerID: pbft.serverID,
@@ -337,17 +361,22 @@ func (pbft *PBFT) ReceivePrepare(request *CRequest) {
 
 		signature := pbft.signDataByte(payload)
 
-		nextRequest := &CRequest{
-			MsgType:   CMsgType_COMMIT,
+		nextRequest := &PbftRequest{
+			MsgType:   CMsgType_AGGREGATED_PREPARE,
 			Payload:   payload,
 			Signature: signature,
 		}
 
 		pbft.Broadcast(nextRequest)
+		//pbft.SendToPrimary()
 	}
 }
 
-func (pbft *PBFT) ReceiveCommit(request *CRequest) {
+func (pbft *PBFT) ReceiveAggregatedPrepare(request *PbftRequest) {
+
+}
+
+func (pbft *PBFT) ReceiveCommit(request *PbftRequest) {
 	//log.Printf("Preprepare response")
 	var commitMsg CommitMsg
 	err := json.Unmarshal(request.Payload, &commitMsg)
@@ -380,16 +409,37 @@ func (pbft *PBFT) ReceiveCommit(request *CRequest) {
 		cInstance.Prepared = true
 		cInstance.Committed = true
 		address := publicKeyByteToAddress(cInstance.InsID.ClientPublicKeyByte)
-		pbft.cSeqNum[address] += 1
+		curSeqNum, _ := pbft.cSeqNum.Get(address)
+		pbft.cSeqNum.Set(address, curSeqNum+1)
+		commitCount.Add(1)
 		// TODO execute operation
-
+		value := commitCount.Load()
+		log.Printf("commit count %d", value)
+		if value == 400 {
+			log.Print(time.Now())
+		}
 		// response to the client
 	}
 }
 
-func (pbft *PBFT) Broadcast(request *CRequest) {
+func (pbft *PBFT) ReceiveAggregatedCommit(request *PbftRequest) {
+
+}
+
+func (pbft *PBFT) SendToPrimary(primaryID int, request *PbftRequest) {
+	primary := pbft.peers[primaryID]
+	err := primary.ClientStream.Send(request)
+	if err != nil {
+		panic(err)
+	}
+}
+
+func (pbft *PBFT) Broadcast(request *PbftRequest) {
 
 	for _, peer := range pbft.peers {
+		if peer.ClientStream == nil {
+			log.Fatalf("Unexpected error")
+		}
 		err := peer.ClientStream.Send(request)
 		if err != nil {
 			log.Fatalf("fail to send preprepare msg %v", err)
@@ -397,17 +447,27 @@ func (pbft *PBFT) Broadcast(request *CRequest) {
 	}
 }
 
+//func (pbft *PBFT) PrimaryEventLoop(request *PbftRequest) {
+//	switch request.MsgType {
+//
+//	}
+//}
+
 // Backup event loop is to react on request
-func (pbft *PBFT) EventLoop(stream Consensus_CStreamServer, request *CRequest) {
+func (pbft *PBFT) EventLoop(request *PbftRequest) {
 	switch request.MsgType {
 	case CMsgType_PREPREPARE:
 		// on receive preprepare, broadcast prepare
-		pbft.ReceivePreprepare(request)
+		pbft.ReceivePreprepare(request) // send prepare to the commit
 	case CMsgType_PREPARE:
 		// on receiving enough prepare, broadcast commit
-		pbft.ReceivePrepare(request)
+		pbft.ReceivePrepare(request) // used by the primary
+	case CMsgType_AGGREGATED_PREPARE:
+		pbft.ReceiveAggregatedPrepare(request) // used by the backup
 	case CMsgType_COMMIT:
 		// on receive enough commit, execute operation
 		pbft.ReceiveCommit(request)
+	case CMsgType_AGGREGATED_COMMIT:
+		pbft.ReceiveAggregatedCommit(request)
 	}
 }

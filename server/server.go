@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	pb "github.com/anxinzhou/LPBFT/pbft"
@@ -18,13 +19,26 @@ type Server struct {
 	pb.UnimplementedConsensusServer
 }
 
-func (s *Server) GetPublicKey(ctx context.Context, pkrequest *pb.PkRequest) (*pb.PkResponse, error) {
+func (s *Server) GetPublicKey(ctx context.Context, pkRequest *pb.PkRequest) (*pb.PkResponse, error) {
 	return &pb.PkResponse{
 		Payload: s.pbft.PublicKeyByte,
 	}, nil
 }
 
-func (s *Server) CStream(stream pb.Consensus_CStreamServer) error {
+func (s *Server) ClientOperation(ctx context.Context, operationRequest *pb.OperationRequest) (*pb.OperationResponse, error) {
+	var clientMsg pb.ClientMsg
+	err := json.Unmarshal(operationRequest.Payload, &clientMsg)
+	if err != nil {
+		log.Fatalf("fail to marshal client request")
+	}
+
+	//completeStatus:= make(chan int)
+	s.pbft.BroadcastPreprepare(&clientMsg)
+	return nil, nil
+	// TODO how to know when the request is done
+}
+
+func (s *Server) PBFTMessaging(stream pb.Consensus_PBFTMessagingServer) error {
 	for {
 		request, err := stream.Recv()
 		if err == io.EOF {
@@ -33,7 +47,7 @@ func (s *Server) CStream(stream pb.Consensus_CStreamServer) error {
 		if err != nil {
 			log.Fatalf("can not receive %v", err)
 		}
-		s.pbft.EventLoop(stream, request)
+		s.pbft.EventLoop(request)
 	}
 }
 
@@ -78,26 +92,33 @@ func main() {
 		pbft: pbft,
 	}
 
-	// wait for a second so that all the servers are up
-	time.Sleep(200 * time.Millisecond)
-
 	go func() {
 		defer wg.Done()
 		wg.Add(1)
 		serve(pbftRPC)
 	}()
 
+	// wait so that all the servers are up
+	time.Sleep(200 * time.Millisecond)
+
 	pbft.ConnectPeers(serverAddrs)
 
-	//TODO so far different server will generate different fake client
-	fakeClient := pb.NewFakeClient()
-	// if is primary
-	primary := pbft.PrimaryOfClient(fakeClient.PublicKeyByte)
-	log.Printf("The primary of the fake client is %d", primary)
-	// assign client to a fixed primary
-	if *serverID == primary {
-		clientMsg := fakeClient.MakeFakeRequest()
+	// wait so that peers are mutually connected.
+	time.Sleep(200 * time.Millisecond)
+
+	clientNum := 100
+	clients := make([]*pb.FakeClient, clientNum)
+	for i := 1; i < clientNum; i++ {
+		clients[i] = pb.NewFakeClient(*serverID)
+	}
+	log.Print(time.Now())
+	for i := 1; i < clientNum; i++ {
+		// so far let the client appoint the primary...
+		log.Printf("fake client generated")
+		clientMsg := clients[i].MakeFakeRequest()
 		pbft.BroadcastPreprepare(clientMsg)
 	}
+
+	// how to know when will the requests be finished
 	wg.Wait()
 }

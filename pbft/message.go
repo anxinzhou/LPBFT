@@ -27,6 +27,7 @@ type ClientMsg struct {
 	MessageType int
 	InsID       *InstanceID
 	Payload     []byte
+	Primary     int
 	Signature   []byte // client's signature for the payload
 }
 

@@ -13,21 +13,25 @@ type ConsensusInstance struct {
 	InsID   *InstanceID
 	MsgType int    // belongs to PAYMENT/OFF2ON/ON2OFF
 	Payload []byte // store the exact message
+	Primary int    //
 
 	//Quorums   []Consensus_CStreamClient
 	//Preprepares []*PreprepareResponse
-	Prepares  []*PrepareMsg // store prepare response from backups
-	Commits   []*CommitMsg  // store commit response from backups
-	Prepared  bool          // True given 2f+1 prepare message
-	Committed bool          // True given 2f+1 commit messages
-	mu        *sync.Mutex   // prevent concurrent access to the above five objects
+	Prepares    []*PrepareMsg // store prepare response from backups
+	Commits     []*CommitMsg  // store commit response from backups
+	Preprepared bool          // True after receiving preprepared
+	Prepared    bool          // True given 2f+1 prepare message
+	Committed   bool          // True given 2f+1 commit messages
+	mu          *sync.Mutex   // prevent concurrent access to the above five objects
 }
 
-func NewConsensusInstance(insID *InstanceID, msgType int, payload []byte) *ConsensusInstance {
+func NewConsensusInstance(insID *InstanceID, msgType int, payload []byte, primary int) *ConsensusInstance {
 	return &ConsensusInstance{
 		InsID:   insID,
 		MsgType: msgType,
 		Payload: payload,
+
+		Primary: primary,
 		//Preprepares: []*PreprepareResponse{},
 		Prepares:  []*PrepareMsg{},
 		Commits:   []*CommitMsg{},
