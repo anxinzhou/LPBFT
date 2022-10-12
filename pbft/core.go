@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/ecdsa"
 	"encoding/json"
+	"errors"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/orcaman/concurrent-map/v2"
@@ -12,13 +13,19 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"log"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
-var commitCount atomic.Int32
-var prepareCount atomic.Int32
+var commitedCount atomic.Int32
+var commitCount atomic.Int32 // just a single commit message
+var preparedCount atomic.Int32
+var prepareCount atomic.Int32 // just a single prepare message
+var preprepareCount atomic.Int32
+var Start time.Time
+var PRINT_INTERVAL int32 = 200
 
 // fault tolerance level
 
@@ -32,15 +39,29 @@ type PBFT struct {
 
 	PublicKeyByte []byte
 	privateKey    *ecdsa.PrivateKey
-	serverID      int
+	serverID      int32
 }
 
 type Peer struct {
 	ClientStream  Consensus_PBFTMessagingClient
 	PublicKeyByte []byte
+	mu            sync.Mutex
 }
 
-func NewPBFT(serverID int, faultTolerance int) *PBFT {
+func (p *Peer) SendRequest(request *PbftRequest) {
+	// prevent concurrent access to stream.Send
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.ClientStream == nil {
+		log.Fatalf("Unexpected error")
+	}
+	err := p.ClientStream.Send(request)
+	if err != nil {
+		log.Fatalf("fail to send preprepare msg %v", err)
+	}
+}
+
+func NewPBFT(serverID int32, faultTolerance int) *PBFT {
 
 	pbft := &PBFT{
 		peers:      []*Peer{},
@@ -108,10 +129,29 @@ func (pbft *PBFT) AddInstance(insID *InstanceID, instance *ConsensusInstance) {
 	}
 }
 
-func (pbft *PBFT) ConnectPeers(peerAddrs []string) {
-	pbft.peers = make([]*Peer, len(peerAddrs))
+func (pbft *PBFT) GetInstance(insID *InstanceID) (*ConsensusInstance, bool) {
+	address := publicKeyByteToAddress(insID.ClientPublicKeyByte)
+	if cInstances, ok := pbft.cInstances.Get(address); ok {
+		if len(cInstances) > insID.SequenceNum {
+			return cInstances[insID.SequenceNum], true
+		} else {
+			return nil, false
+		}
+	} else {
+		return nil, false
+	}
+}
+
+func (pbft *PBFT) ConnectPeers(serverAddrs []string) {
+	pbft.peers = make([]*Peer, len(serverAddrs))
 	var wg sync.WaitGroup
-	for i, addr := range peerAddrs {
+	for i, addr := range serverAddrs {
+		if int32(i) == pbft.serverID {
+			pbft.peers[i] = &Peer{
+				ClientStream:  nil,
+				PublicKeyByte: pbft.PublicKeyByte,
+			}
+		}
 		index := i
 		peerAddr := addr
 		wg.Add(1)
@@ -222,20 +262,24 @@ func (pbft *PBFT) verifyClientMsg(clientMsg *ClientMsg) bool {
 }
 
 // by the primary
-func (pbft *PBFT) BroadcastPreprepare(clientMsg *ClientMsg) chan int {
-	log.Printf("Send a preprepare")
+func (pbft *PBFT) BroadcastPreprepare(clientMsg *ClientMsg) {
+	//log.Printf("Send a preprepare")
 
 	if !pbft.verifyClientMsg(clientMsg) {
-		return nil
+		//return nil
+		panic("fail to verify client message")
 	}
 
 	preprepareMsg := &PreprerareMsg{
 		InsID:     clientMsg.InsID,
-		PrimaryID: pbft.serverID,
 		ViewNum:   0, // TODO
 		Timestamp: 1, // TODO
 		Msg:       clientMsg,
 	}
+
+	// prepare
+	pbft.prepare(preprepareMsg)
+	// add to aggregated signature
 
 	payload, err := json.Marshal(preprepareMsg)
 	if err != nil {
@@ -243,23 +287,65 @@ func (pbft *PBFT) BroadcastPreprepare(clientMsg *ClientMsg) chan int {
 	}
 
 	request := &PbftRequest{
-		MsgType: CMsgType_PREPREPARE,
-		Payload: payload,
+		MsgType:  CMsgType_PREPREPARE,
+		Payload:  payload,
+		ServerID: int32(pbft.serverID),
 	}
 
 	// Broadcast preprepare
 	pbft.Broadcast(request)
-	return make(chan int)
+
+	value := preprepareCount.Add(1)
+	if value%PRINT_INTERVAL == 0 {
+		log.Printf("preprepare sent %d", value)
+	}
+
+	//return make(chan int)
+}
+
+// update local state
+func (pbft *PBFT) prepare(preprepareMsg *PreprerareMsg) *PbftRequest {
+	// add a new instance
+	cInstance := NewConsensusInstance(preprepareMsg)
+	pbft.AddInstance(
+		preprepareMsg.InsID, cInstance)
+
+	prepareMsg := cInstance.PrepareMsg
+
+	prepareMsgByte, err := json.Marshal(prepareMsg)
+	if err != nil {
+		panic(err)
+	}
+	signatureByte := pbft.signDataByte(prepareMsgByte)
+	signature := &Signature{
+		Payload:  signatureByte,
+		ServerID: pbft.serverID,
+	}
+
+	if preprepareMsg.Msg.Primary == pbft.serverID {
+		cInstance.AggregatedPrepares.appendPrepareMsg(prepareMsg, signature)
+		cInstance.AggregatedPrepares.InsID = prepareMsg.InsID
+		return nil
+	} else {
+		nextReq := &PbftRequest{
+			ServerID:      int32(pbft.serverID),
+			MsgType:       CMsgType_PREPARE,
+			Payload:       prepareMsgByte,
+			SignatureByte: pbft.signDataByte(prepareMsgByte),
+		}
+		return nextReq
+	}
 }
 
 // used by backups
 func (pbft *PBFT) ReceivePreprepare(request *PbftRequest) {
-
+	//time.Sleep(1 * time.Second)
 	//log.Printf("Preprepare response")
 	var preprepareMsg PreprerareMsg
 	err := json.Unmarshal(request.Payload, &preprepareMsg)
 	if err != nil {
 		log.Fatalf("cannot unmarshal payload")
+		return
 	}
 
 	// verify preprepareMsg
@@ -267,8 +353,7 @@ func (pbft *PBFT) ReceivePreprepare(request *PbftRequest) {
 	// so far only verify client message
 	clientMsg := preprepareMsg.Msg
 	if !pbft.verifyClientMsg(clientMsg) {
-		log.Printf("Incorrect client signature")
-		return
+		log.Fatalf("Incorrect client signature")
 	}
 
 	// from the right primary
@@ -278,41 +363,80 @@ func (pbft *PBFT) ReceivePreprepare(request *PbftRequest) {
 	//	return
 	//}
 	primary := clientMsg.Primary
-	if primary != preprepareMsg.PrimaryID {
-		log.Printf("From incorrect primary")
-		return
+	if primary != request.ServerID {
+		log.Fatalf("From incorrect primary")
 	}
 
-	// add a new instance
-	cInstance := NewConsensusInstance(preprepareMsg.InsID, preprepareMsg.Msg.MessageType, preprepareMsg.Msg.Payload, primary)
-	pbft.AddInstance(
-		preprepareMsg.InsID, cInstance)
-	cInstance.Preprepared = true
+	nextReq := pbft.prepare(&preprepareMsg)
+	//pbft.Broadcast(nextReq)
+	pbft.SendToPrimary(primary, nextReq)
 
-	prepareRequest := &PrepareMsg{
-		InsID:    preprepareMsg.InsID,
+	value := prepareCount.Add(1)
+	if value%PRINT_INTERVAL == 0 {
+		log.Printf("prepare sent %d", value)
+	}
+}
+
+func (pbft *PBFT) prepared(msg *AggregatedPrepareMsg) *PbftRequest {
+	cInstance, ok := pbft.GetInstance(msg.InsID)
+	if !ok {
+		panic(errors.New("instance not exist"))
+	}
+	cInstance.Prepared = true
+
+	value := preparedCount.Add(1)
+
+	if value%PRINT_INTERVAL == 0 {
+		log.Printf("prepared count %d, time %s", value, time.Since(Start))
+	}
+
+	commitMsg := cInstance.CommitMsg
+
+	commitMsgByte, err := json.Marshal(commitMsg)
+	if err != nil {
+		panic(err)
+	}
+	signatureByte := pbft.signDataByte(commitMsgByte)
+	signature := &Signature{
+		Payload:  signatureByte,
 		ServerID: pbft.serverID,
-		ViewNum:  preprepareMsg.ViewNum,
 	}
 
-	payload, err := json.Marshal(prepareRequest)
+	if cInstance.PreprerareMsg.Msg.Primary == pbft.serverID {
+		cInstance.AggregatedCommits.AppendCommitMsg(commitMsg, signature)
+		cInstance.AggregatedCommits.InsID = commitMsg.InsID
+		return nil
+	} else {
+		nextReq := &PbftRequest{
+			ServerID:      int32(pbft.serverID),
+			MsgType:       CMsgType_COMMIT,
+			Payload:       commitMsgByte,
+			SignatureByte: pbft.signDataByte(commitMsgByte),
+		}
+		return nextReq
+	}
+}
+
+func (pbft *PBFT) sendAggregatePreparesToPeers(aggregatedPrepares *AggregatedPrepareMsg, peerIDs []int32) {
+	payload, err := json.Marshal(aggregatedPrepares)
 	if err != nil {
 		log.Fatalf("cannot marshal request")
 	}
 
-	signature := pbft.signDataByte(payload)
-
-	nextReq := &PbftRequest{
-		MsgType:   CMsgType_PREPARE,
-		Payload:   payload,
-		Signature: signature,
+	//log.Printf("aggregated prepare length %d", cInstance.AggregatedPrepares.Length)
+	nextRequest := &PbftRequest{
+		MsgType:  CMsgType_AGGREGATED_PREPARE,
+		Payload:  payload,
+		ServerID: pbft.serverID,
 	}
 
-	//pbft.Broadcast(nextReq)
-	pbft.SendToPrimary(primary, nextReq)
+	for _, peerID := range peerIDs {
+		peer := pbft.peers[peerID]
+		peer.SendRequest(nextRequest)
+	}
 }
 
-// used by the primary
+// used by the primary to aggregate prepare message
 func (pbft *PBFT) ReceivePrepare(request *PbftRequest) {
 	//log.Printf("Preprepare response")
 	var prepareMsg PrepareMsg
@@ -321,61 +445,152 @@ func (pbft *PBFT) ReceivePrepare(request *PbftRequest) {
 		log.Fatalf("cannot unmarshal payload")
 	}
 
-	// verify prepare message
-	// check the signature
-	fromServer := prepareMsg.ServerID
-	fromServerPublicKeyByte := pbft.peers[fromServer].PublicKeyByte
-	if !verifySignature(fromServerPublicKeyByte, request.Payload, request.Signature) {
-		log.Printf("Incorrect prepare signature")
+	// discard unmatched prepare
+	var baselinePrepareMsg *PrepareMsg
+	cInstance, ok := pbft.GetInstance(prepareMsg.InsID)
+	if !ok {
+		log.Fatalf("preprepare should exist before receiving a prepare")
+	} else {
+		baselinePrepareMsg = cInstance.PrepareMsg
 	}
 
-	cInstance, ok := pbft.Instance(prepareMsg.InsID)
-	if !ok {
-		log.Printf("should receive preprepare first before accepting a prepare")
-		return
+	// verify prepare message
+	// should be equal to the basic line
+	if !reflect.DeepEqual(baselinePrepareMsg, &prepareMsg) {
+		log.Fatalf("Prepare message from backup should match that of the primary")
 	}
 
 	cInstance.Lock()
 	defer cInstance.Unlock()
-	cInstance.AddPrepareMsg(&prepareMsg)
+	// respond with aggregated signature
+	if cInstance.Prepared {
+		pbft.sendAggregatePreparesToPeers(cInstance.AggregatedPrepares, []int32{request.ServerID})
+		return
+	}
+
+	// check the signature
+	fromServer := request.ServerID
+	fromServerPublicKeyByte := pbft.peers[fromServer].PublicKeyByte
+	if !verifySignature(fromServerPublicKeyByte, request.Payload, request.SignatureByte) {
+		log.Fatalf("Incorrect prepare signature")
+	}
+
+	signature := &Signature{
+		Payload:  request.SignatureByte,
+		ServerID: fromServer,
+	}
+	cInstance.AggregatedPrepares.appendPrepareMsg(&prepareMsg, signature)
+	//cInstance.AddPrepareMsg(&prepareMsg)
 
 	// after collecting enough prepares
-	if len(cInstance.Prepares) == 2*pbft.f+1 {
-		log.Printf("Request prepared")
-		cInstance.Prepared = true
+	if cInstance.AggregatedPrepares.Length == 2*pbft.f+1 {
+		//log.Printf("Request prepared")
 
-		prepareCount.Add(1)
-		value := prepareCount.Load()
-		log.Printf("prepare count %d", value)
+		pbft.prepared(cInstance.AggregatedPrepares)
 
-		commitMsg := &CommitMsg{
-			InsID:    prepareMsg.InsID,
-			ServerID: pbft.serverID,
-			ViewNum:  prepareMsg.ViewNum,
+		//Only respond to those who has sent prepare
+		// This makes sure that those peers have received the client msg in preprepare
+		peerIDs := []int32{}
+		for _, sig := range (cInstance.AggregatedPrepares).Signatures {
+			serverID := sig.ServerID
+			// skip if send to itself
+			if serverID == pbft.serverID {
+				continue
+			}
+			peerIDs = append(peerIDs, serverID)
 		}
-
-		payload, err := json.Marshal(commitMsg)
-		if err != nil {
-			log.Fatalf("cannot marshal request")
-		}
-
-		signature := pbft.signDataByte(payload)
-
-		nextRequest := &PbftRequest{
-			MsgType:   CMsgType_AGGREGATED_PREPARE,
-			Payload:   payload,
-			Signature: signature,
-		}
-
-		pbft.Broadcast(nextRequest)
+		pbft.sendAggregatePreparesToPeers(cInstance.AggregatedPrepares, peerIDs)
+		//log.Printf("broadcast aggreagated prepares")
 		//pbft.SendToPrimary()
 	}
 }
 
 func (pbft *PBFT) ReceiveAggregatedPrepare(request *PbftRequest) {
+	var aggregatedPrepareMsg AggregatedPrepareMsg
+	err := json.Unmarshal(request.Payload, &aggregatedPrepareMsg)
+	if err != nil {
+		panic(err)
+	}
+	// should have 2f+1
+	if aggregatedPrepareMsg.Length != 2*pbft.f+1 {
+		panic(errors.New("should have 2f+1 prepares"))
+	}
 
+	// must receive preprepare before
+	cInstance, ok := pbft.GetInstance(aggregatedPrepareMsg.InsID)
+	if !ok {
+		log.Printf("Must receive preprepare before")
+		return
+	}
+
+	baselinePrepareMsg := cInstance.PrepareMsg
+
+	for i := 0; i < 2*pbft.f+1; i++ {
+		prepareMsg := aggregatedPrepareMsg.PrepareMsgs[i]
+		signature := aggregatedPrepareMsg.Signatures[i]
+		serverPKByte := pbft.peers[signature.ServerID].PublicKeyByte
+
+		msgByte, err := json.Marshal(prepareMsg)
+		if err != nil {
+			panic(err)
+		}
+
+		// verify signature
+		if !verifySignature(serverPKByte, msgByte, signature.Payload) {
+			panic(errors.New("Fail to verify signature"))
+		}
+
+		// 2f+1 should match
+		if !reflect.DeepEqual(baselinePrepareMsg, prepareMsg) {
+			log.Fatalf("2f+1 prepare messages should match")
+		}
+	}
+
+	nextReq := pbft.prepared(&aggregatedPrepareMsg)
+	pbft.SendToPrimary(request.ServerID, nextReq)
+
+	//value := commitCount.Add(1)
+	//
+	//if value%PRINT_INTERVAL == 0 {
+	//	log.Printf("commit sent %d", value)
+	//}
 }
 
+func (pbft *PBFT) commit(msg *AggregatedCommitMsg) {
+	cInstance, ok := pbft.GetInstance(msg.InsID)
+	if !ok {
+		panic(errors.New("instance not exist"))
+	}
+	cInstance.Committed = true
+
+	value := commitedCount.Add(1)
+
+	if value%PRINT_INTERVAL == 0 {
+		log.Printf("commit count %d, time %s", value, time.Since(Start))
+	}
+	// execute opeartion
+}
+
+func (pbft *PBFT) sendAggregateCommitsToPeers(aggregatedCommits *AggregatedCommitMsg, peerIDs []int32) {
+	payload, err := json.Marshal(aggregatedCommits)
+	if err != nil {
+		log.Fatalf("cannot marshal request")
+	}
+
+	//log.Printf("aggregated prepare length %d", cInstance.AggregatedPrepares.Length)
+	nextRequest := &PbftRequest{
+		MsgType:  CMsgType_AGGREGATED_COMMIT,
+		Payload:  payload,
+		ServerID: pbft.serverID,
+	}
+
+	for _, peerID := range peerIDs {
+		peer := pbft.peers[peerID]
+		peer.SendRequest(nextRequest)
+	}
+}
+
+// used by the primary to aggregate commit
 func (pbft *PBFT) ReceiveCommit(request *PbftRequest) {
 	//log.Printf("Preprepare response")
 	var commitMsg CommitMsg
@@ -384,66 +599,122 @@ func (pbft *PBFT) ReceiveCommit(request *PbftRequest) {
 		log.Fatalf("cannot unmarshal payload")
 	}
 
-	// verify prepare message
-	// check the signature
-	fromServer := commitMsg.ServerID
-	fromServerPublicKeyByte := pbft.peers[fromServer].PublicKeyByte
-
-	if !verifySignature(fromServerPublicKeyByte, request.Payload, request.Signature) {
-		log.Printf("Incorrect commit signature")
-	}
-
-	cInstance, ok := pbft.Instance(commitMsg.InsID)
+	// discard unmatched prepare
+	var baselineCommitMsg *CommitMsg
+	cInstance, ok := pbft.GetInstance(commitMsg.InsID)
 	if !ok {
-		log.Printf("should receive preprepare first before accepting a prepare")
-		return
+		log.Fatalf("preprepare should exist before receiving a commit")
+	} else {
+		baselineCommitMsg = cInstance.CommitMsg
 	}
 
 	cInstance.Lock()
 	defer cInstance.Unlock()
-	cInstance.AddCommitMsg(&commitMsg)
+	// skip if already committed
+	if cInstance.Committed {
+		pbft.sendAggregateCommitsToPeers(cInstance.AggregatedCommits, []int32{request.ServerID})
+		return
+	}
+
+	// verify prepare message
+	// should be equal to the basic line
+	if !reflect.DeepEqual(baselineCommitMsg, &commitMsg) {
+		log.Fatalf("commit message from backup should match that of the primary")
+	}
+
+	// check the signature
+	fromServer := request.ServerID
+	fromServerPublicKeyByte := pbft.peers[fromServer].PublicKeyByte
+	if !verifySignature(fromServerPublicKeyByte, request.Payload, request.SignatureByte) {
+		log.Fatalf("Incorrect commit signature")
+	}
+
+	signature := &Signature{
+		Payload:  request.SignatureByte,
+		ServerID: fromServer,
+	}
+	cInstance.AggregatedCommits.AppendCommitMsg(&commitMsg, signature)
+	//cInstance.AddPrepareMsg(&prepareMsg)
 
 	// after collecting enough prepares
-	if len(cInstance.Commits) == 2*pbft.f+1 {
-		log.Printf("Request committed")
-		cInstance.Prepared = true
-		cInstance.Committed = true
-		address := publicKeyByteToAddress(cInstance.InsID.ClientPublicKeyByte)
-		curSeqNum, _ := pbft.cSeqNum.Get(address)
-		pbft.cSeqNum.Set(address, curSeqNum+1)
-		commitCount.Add(1)
-		// TODO execute operation
-		value := commitCount.Load()
-		log.Printf("commit count %d", value)
-		if value == 400 {
-			log.Print(time.Now())
+	if cInstance.AggregatedCommits.Length == 2*pbft.f+1 {
+		//log.Printf("Request prepared")
+
+		pbft.commit(cInstance.AggregatedCommits)
+
+		//Only respond to those who has sent commit
+		peerIDs := []int32{}
+		for _, sig := range (cInstance.AggregatedCommits).Signatures {
+			serverID := sig.ServerID
+			// skip if send to itself
+			if serverID == pbft.serverID {
+				continue
+			}
+			peerIDs = append(peerIDs, serverID)
 		}
-		// response to the client
+
+		pbft.sendAggregateCommitsToPeers(cInstance.AggregatedCommits, peerIDs)
+		//pbft.SendToPrimary()
 	}
 }
 
 func (pbft *PBFT) ReceiveAggregatedCommit(request *PbftRequest) {
-
-}
-
-func (pbft *PBFT) SendToPrimary(primaryID int, request *PbftRequest) {
-	primary := pbft.peers[primaryID]
-	err := primary.ClientStream.Send(request)
+	var aggregatedCommitMsg AggregatedCommitMsg
+	err := json.Unmarshal(request.Payload, &aggregatedCommitMsg)
 	if err != nil {
 		panic(err)
 	}
+	// should have 2f+1
+	if aggregatedCommitMsg.Length != 2*pbft.f+1 {
+		panic(errors.New("should have 2f+1 prepares"))
+	}
+
+	// must receive preprepare before
+	cInstance, ok := pbft.GetInstance(aggregatedCommitMsg.InsID)
+	if !ok {
+		log.Printf("Must receive preprepare before")
+		return
+	}
+
+	baselineCommitMsg := cInstance.CommitMsg
+
+	for i := 0; i < 2*pbft.f+1; i++ {
+		commitMsg := aggregatedCommitMsg.CommitMsgs[i]
+		signature := aggregatedCommitMsg.Signatures[i]
+		serverPKByte := pbft.peers[signature.ServerID].PublicKeyByte
+
+		msgByte, err := json.Marshal(commitMsg)
+		if err != nil {
+			panic(err)
+		}
+
+		// verify signature
+		if !verifySignature(serverPKByte, msgByte, signature.Payload) {
+			panic(errors.New("Fail to verify signature"))
+		}
+
+		// 2f+1 should match
+		if !reflect.DeepEqual(baselineCommitMsg, commitMsg) {
+			log.Fatalf("2f+1 prepare messages should match")
+		}
+	}
+	pbft.commit(&aggregatedCommitMsg)
 }
 
-func (pbft *PBFT) Broadcast(request *PbftRequest) {
+func (pbft *PBFT) SendToPrimary(primaryID int32, request *PbftRequest) {
+	if primaryID == pbft.serverID {
+		log.Fatalf("unexpected error")
+	}
+	primary := pbft.peers[primaryID]
+	primary.SendRequest(request)
+}
 
-	for _, peer := range pbft.peers {
-		if peer.ClientStream == nil {
-			log.Fatalf("Unexpected error")
+func (pbft *PBFT) Broadcast(request *PbftRequest) { // not include itself
+	for i, peer := range pbft.peers {
+		if int32(i) == pbft.serverID {
+			continue
 		}
-		err := peer.ClientStream.Send(request)
-		if err != nil {
-			log.Fatalf("fail to send preprepare msg %v", err)
-		}
+		peer.SendRequest(request)
 	}
 }
 
@@ -457,15 +728,12 @@ func (pbft *PBFT) Broadcast(request *PbftRequest) {
 func (pbft *PBFT) EventLoop(request *PbftRequest) {
 	switch request.MsgType {
 	case CMsgType_PREPREPARE:
-		// on receive preprepare, broadcast prepare
 		pbft.ReceivePreprepare(request) // send prepare to the commit
 	case CMsgType_PREPARE:
-		// on receiving enough prepare, broadcast commit
 		pbft.ReceivePrepare(request) // used by the primary
 	case CMsgType_AGGREGATED_PREPARE:
 		pbft.ReceiveAggregatedPrepare(request) // used by the backup
 	case CMsgType_COMMIT:
-		// on receive enough commit, execute operation
 		pbft.ReceiveCommit(request)
 	case CMsgType_AGGREGATED_COMMIT:
 		pbft.ReceiveAggregatedCommit(request)

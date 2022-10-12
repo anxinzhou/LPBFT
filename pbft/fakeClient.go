@@ -11,11 +11,11 @@ type FakeClient struct {
 	PublicKeyByte []byte
 	privateKey    *ecdsa.PrivateKey
 	SeqNum        int
-	Primary       int
+	Primary       int32
 }
 
 // so far let client appoint the primary
-func NewFakeClient(primay int) *FakeClient {
+func NewFakeClient(primay int32) *FakeClient {
 	// Generate a key pair for the client
 	privateKey, err := crypto.GenerateKey()
 

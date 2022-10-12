@@ -30,9 +30,10 @@ message pkResponse {
 }
 
 message pbftRequest {
-  cMsgType msgType = 1;
-  bytes payload = 2;
-  bytes signature = 3;
+  int32 serverID = 1;
+  cMsgType msgType = 2;
+  bytes payload = 3;
+  bytes signatureByte = 4;
 }
 
 message pbftResponse {
