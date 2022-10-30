@@ -12,17 +12,26 @@ grpc_go := $(proto_src:%.proto=%_grpc.pb.go)
 
 #binaries := pbft plot
 
+export GOPATH := /home/anxin/go
+export GOROOT := /usr/local/go
+
 binaries := server
 
 .PHONY: all debug clean protos download tools $(binaries)
 
 all: $(binaries)
+	#./p$(binaries)
 
 debug: GCFLAGS += -gcflags='all=-N -l'
 debug: $(binaries)
+	#./p$(binaries)
 
 $(binaries): protos
-	go build -o ./p$@ $(GCFLAGS) ./$@
+	go build -o ./p$@_linux $(GCFLAGS) ./$@
+
+run: ./p$@_linux
+
+build_and_run: debug run
 
 protos: $(proto_go) $(gorums_go)
 
@@ -35,8 +44,8 @@ download:
 test:
 	@go test -v ./...
 
-clean:
-	@rm -fv $(binaries)
+#clean:
+#	@rm -fv $(binaries)
 
 %.pb.go %_grpc.pb.go : %.proto
 	protoc --go_out=paths=source_relative:. \

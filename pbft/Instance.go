@@ -61,10 +61,12 @@ func NewConsensusInstance(preprepareMsg *PreprerareMsg) *ConsensusInstance {
 		//Primary: primary,
 		//Preprepares: []*PreprepareResponse{},
 		AggregatedPrepares: &AggregatedPrepareMsg{
+			InsID:       preprepareMsg.InsID,
 			PrepareMsgs: []*PrepareMsg{},
 			Signatures:  []*Signature{},
 		},
 		AggregatedCommits: &AggregatedCommitMsg{
+			InsID:      preprepareMsg.InsID,
 			CommitMsgs: []*CommitMsg{},
 			Signatures: []*Signature{},
 		},

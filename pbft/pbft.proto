@@ -11,6 +11,7 @@ package pbft;
 service Consensus {
   rpc GetPublicKey(pkRequest) returns (pkResponse) {}
   rpc PBFTMessaging (stream pbftRequest) returns (pbftResponse) {} // used for pbft among servers
+  rpc BatchPBFTMessaging (stream batchPBFTRequest) returns (batchPbftResponse) {}
   rpc ClientOperation (operationRequest) returns (operationResponse) {}
 }
 
@@ -29,11 +30,29 @@ message pkResponse {
   bytes payload = 1;
 }
 
+message batchPBFTRequest {
+  int32 serverID = 1;
+  repeated pbftRequest pbftRequests = 3;
+//  merkleSig merkleSig = 5;
+  bytes signatureByte = 4;
+}
+
+message batchPbftResponse {
+
+}
+
 message pbftRequest {
   int32 serverID = 1;
   cMsgType msgType = 2;
   bytes payload = 3;
-  bytes signatureByte = 4;
+  bytes signatureByte = 4;  // nil if batch signature is used
+//  merkleSig merkleSig = 5;
+}
+
+message merkleSig {
+  bytes root = 1;
+  bytes proof = 2;
+  bytes signatureByte = 3;
 }
 
 message pbftResponse {

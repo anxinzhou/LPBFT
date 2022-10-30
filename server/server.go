@@ -3,19 +3,25 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	pb "github.com/anxinzhou/LPBFT/pbft"
 	"github.com/ethereum/go-ethereum/crypto"
+	mt "github.com/txaty/go-merkletree"
 	"google.golang.org/grpc"
 	"io"
 	"log"
 	"net"
+	"net/http"
+	"net/http/pprof"
 	"runtime"
 	"sync"
 	"time"
+
+	_ "net/http/pprof"
 )
 
 type Server struct {
@@ -55,9 +61,27 @@ func (s *Server) PBFTMessaging(stream pb.Consensus_PBFTMessagingServer) error {
 	}
 }
 
+func (s *Server) BatchPBFTMessaging(stream pb.Consensus_BatchPBFTMessagingServer) error {
+	for {
+		request, err := stream.Recv() // will it park go routine? Because so far seems the program get stuck
+		if err == io.EOF {
+			panic(err)
+		}
+
+		if err != nil {
+			log.Fatalf("can not receive %v", err)
+		}
+
+		//log.Printf("receive a batch request with # %d", request.BatchNum)
+
+		go s.pbft.BatchEventLoop(request)
+	}
+}
+
 var (
-	port     = flag.Int("port", 50001, "The server port")
+	port     = flag.Int("port", 50000, "The server port")
 	serverID = flag.Int("id", 0, "The server identity")
+	ip       = flag.String("ip", "127.0.0.1", "The server address")
 )
 
 var (
@@ -66,6 +90,9 @@ var (
 		"localhost:50001",
 		"localhost:50002",
 		"localhost:50003",
+		//"localhost:50004",
+		//"localhost:50005",
+		//"localhost:50006",
 	}
 )
 
@@ -122,7 +149,7 @@ func testSignatureVerification(clientNum int, threadNum int) {
 	}
 	wg.Wait()
 
-	log.Printf("time %s", time.Since(start))
+	log.Printf("sign time %s", time.Since(start))
 	//verification performance
 	start = time.Now()
 
@@ -150,9 +177,94 @@ func testSignatureVerification(clientNum int, threadNum int) {
 	log.Printf("verify time %s", time.Since(start))
 }
 
+type testData struct {
+	data []byte
+}
+
+func (t *testData) Serialize() ([]byte, error) {
+	return t.data, nil
+}
+
+// generate dummy data blocks
+func generateRandBlocks(size int) (blocks []mt.DataBlock) {
+	for i := 0; i < size; i++ {
+		block := &testData{
+			data: make([]byte, 100),
+		}
+		_, err := rand.Read(block.data)
+		if err != nil {
+			panic(err)
+		}
+		blocks = append(blocks, block)
+	}
+	return
+}
+
+func testBatchMerkle(sampleSize int, batchSize int) {
+
+	start := time.Now()
+	for i := 0; i < sampleSize/batchSize; i++ {
+		blocks := generateRandBlocks(batchSize)
+		// the first argument is config, if it is nil, then default config is adopted
+		tree, err := mt.New(nil, blocks)
+		if err != nil {
+			panic(err)
+		}
+		// get proofs
+		proofs := tree.Proofs
+		rootHash := tree.Root
+
+		log.Printf("root hash: %v", rootHash)
+
+		//func() {
+		//	tree, err := mt.New(nil, blocks)
+		//	if err != nil {
+		//		panic(err)
+		//	}
+		//	// get proofs
+		//	rootHash := tree.Root
+		//
+		//	log.Printf("root hash2: %v", rootHash)
+		//}()
+		//
+		//return
+
+		blockIDtoTest := 0
+		ok, err := mt.Verify(blocks[blockIDtoTest], proofs[blockIDtoTest], rootHash, nil)
+		if err != nil {
+			panic(err)
+		}
+		if !ok {
+			panic("should be ok")
+		}
+	}
+
+	log.Printf("verification time %s", time.Since(start))
+}
+
 // TODO A stream can be interrupted by a service or connection error. Logic is required to restart stream if there is an error.
 func main() {
+
+	if *serverID == 0 {
+		go func() {
+			r := http.NewServeMux()
+			r.HandleFunc("/debug/pprof/", pprof.Index)
+			r.HandleFunc("/debug/pprof/heap", pprof.Index)
+			r.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+			r.HandleFunc("/debug/pprof/profile", pprof.Profile)
+			r.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+			r.HandleFunc("/debug/pprof/trace", pprof.Trace)
+			err := http.ListenAndServe(":10001", r)
+			if err != nil {
+				panic(err)
+			}
+		}()
+	}
+
 	log.Printf("avaible cpu %d", runtime.NumCPU())
+
+	//testBatchMerkle(100000, 32)
+	//return
 	//testSignatureVerification(99996, 6)
 	//return
 	var wg sync.WaitGroup
@@ -163,37 +275,54 @@ func main() {
 		pbft: pbft,
 	}
 
+	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		wg.Add(1)
 		serve(pbftRPC)
 	}()
 
-	// wait so that all the servers are up
+	// wait for other server is up
 	time.Sleep(200 * time.Millisecond)
 
 	pbft.ConnectPeers(serverAddrs)
 
-	// wait so that peers are mutually connected.
-	time.Sleep(200 * time.Millisecond)
+	// start sending queue if batch mode enabled
+	if pb.MESSAGE_BATCH_ENABLED {
+		go pbft.StartSendQueue()
+	}
 
-	clientNum := 2000
+	// start send queue if batch enabled
+
+	// wait so that peers are mutually connected.
+	//time.Sleep(200 * time.Millisecond)
+
+	clientNum := 4000
 	clients := make([]*pb.FakeClient, clientNum)
 	for i := 0; i < clientNum; i++ {
 		clients[i] = pb.NewFakeClient(int32(*serverID))
 	}
 
-	pb.Start = time.Now()
-	log.Printf("start time %s", time.Now().String())
+	msgs := make([]*pb.ClientMsg, clientNum)
+
 	for i := 0; i < clientNum; i++ {
 		// so far let the client appoint the primary...
 		if i == clientNum/20 {
 			log.Printf("fake client generated %d", i)
 		}
 		clientMsg := clients[i].MakeFakeRequest()
-		pbft.BroadcastPreprepare(clientMsg)
+		msgs[i] = clientMsg
 	}
 
+	// wait for setup
+	time.Sleep(1500 * time.Millisecond)
+
+	pb.Start = time.Now()
+	log.Printf("start time %s", time.Now().String())
+	for i := 0; i < clientNum; i++ {
+		pbft.BroadcastPreprepare(msgs[i])
+	}
 	// how to know when will the requests be finished
 	wg.Wait()
+
+	log.Printf("unexpected close")
 }
