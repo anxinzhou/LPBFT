@@ -15,8 +15,7 @@ import (
 	"io"
 	"log"
 	"net"
-	"net/http"
-	"net/http/pprof"
+	"os"
 	"runtime"
 	"sync"
 	"time"
@@ -27,6 +26,10 @@ import (
 type Server struct {
 	pbft *pb.PBFT
 	pb.UnimplementedConsensusServer
+}
+
+type ServerConfig struct {
+	Address []string `json:"address"`
 }
 
 func (s *Server) GetPublicKey(ctx context.Context, pkRequest *pb.PkRequest) (*pb.PkResponse, error) {
@@ -79,22 +82,24 @@ func (s *Server) BatchPBFTMessaging(stream pb.Consensus_BatchPBFTMessagingServer
 }
 
 var (
-	port     = flag.Int("port", 50000, "The server port")
-	serverID = flag.Int("id", 0, "The server identity")
-	ip       = flag.String("ip", "127.0.0.1", "The server address")
+	port           = flag.Int("port", 50000, "The server port")
+	serverID       = flag.Int("id", 0, "The server identity")
+	configFilePath = flag.String("config-file", "config/localServer.json", "config file")
+	//ip       = flag.String("ip", "127.0.0.1", "The server address")
+	//port = flag.String("address", "", "Server address e.g. 127.0.0.1:8080")
 )
 
-var (
-	serverAddrs = []string{
-		"localhost:50000",
-		"localhost:50001",
-		"localhost:50002",
-		"localhost:50003",
-		//"localhost:50004",
-		//"localhost:50005",
-		//"localhost:50006",
-	}
-)
+//var (
+//	serverAddrs = []string{
+//		"localhost:50000",
+//		"localhost:50001",
+//		"localhost:50002",
+//		"localhost:50003",
+//		//"localhost:50004",
+//		//"localhost:50005",
+//		//"localhost:50006",
+//	}
+//)
 
 func init() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
@@ -244,24 +249,41 @@ func testBatchMerkle(sampleSize int, batchSize int) {
 
 // TODO A stream can be interrupted by a service or connection error. Logic is required to restart stream if there is an error.
 func main() {
-
-	if *serverID == 0 {
-		go func() {
-			r := http.NewServeMux()
-			r.HandleFunc("/debug/pprof/", pprof.Index)
-			r.HandleFunc("/debug/pprof/heap", pprof.Index)
-			r.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
-			r.HandleFunc("/debug/pprof/profile", pprof.Profile)
-			r.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
-			r.HandleFunc("/debug/pprof/trace", pprof.Trace)
-			err := http.ListenAndServe(":10001", r)
-			if err != nil {
-				panic(err)
-			}
-		}()
+	// get config file
+	log.Printf("avaible cpu %d", runtime.NumCPU())
+	jsonFile, err := os.Open(*configFilePath)
+	if err != nil {
+		panic(err)
+	}
+	configByte, err := io.ReadAll(jsonFile)
+	if err != nil {
+		panic(err)
 	}
 
-	log.Printf("avaible cpu %d", runtime.NumCPU())
+	var config ServerConfig
+	err = json.Unmarshal(configByte, &config)
+	if err != nil {
+		panic(err)
+	}
+
+	serverAddrs := config.Address
+	// profiling
+	//if *serverID == 0 {
+	//	go func() {
+	//		r := http.NewServeMux()
+	//		r.HandleFunc("/debug/pprof/", pprof.Index)
+	//		r.HandleFunc("/debug/pprof/heap", pprof.Index)
+	//		r.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	//		r.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	//		r.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	//		r.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	//		err := http.ListenAndServe(":10001", r)
+	//		if err != nil {
+	//			panic(err)
+	//		}
+	//	}()
+	//}
+	//log.Printf("avaible cpu %d", runtime.NumCPU())
 
 	//testBatchMerkle(100000, 32)
 	//return

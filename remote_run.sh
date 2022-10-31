@@ -7,9 +7,9 @@ do
   port=5000$i
   if [ $i != 3 ]
   then
-  ./pserver_linux --port=$port --id=$i --config-file="config/remoteConfig.json" &
+  ./pserver_linux --port=$port --id=$i &
   else
-    ./pserver_linux --port=$port --id=$i --config-file="config/remoteConfig.json"
+    ./pserver_linux --port=$port --id=$i
     fi
 done
 
