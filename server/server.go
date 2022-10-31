@@ -84,7 +84,7 @@ func (s *Server) BatchPBFTMessaging(stream pb.Consensus_BatchPBFTMessagingServer
 var (
 	port           = flag.Int("port", 50000, "The server port")
 	serverID       = flag.Int("id", 0, "The server identity")
-	configFilePath = flag.String("config-file", "config/localServer.json", "config file")
+	configFilePath = flag.String("config-file", "config/localConfig.json", "config file")
 	//ip       = flag.String("ip", "127.0.0.1", "The server address")
 	//port = flag.String("address", "", "Server address e.g. 127.0.0.1:8080")
 )
